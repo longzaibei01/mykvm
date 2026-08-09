@@ -78,7 +78,7 @@ MyKVM runs two channels. LAN discovery uses a plain UDP port; input and clipboar
 | Channel | Default port | Transport | Marker | Purpose |
 | --- | --- | --- | --- | --- |
 | Discovery | UDP `47833` | UDP datagrams | `mykvm.discovery.v1` | LAN discovery, peer probe/reply, host info, and display metadata |
-| Input | UDP `47834` | QUIC datagrams | `mykvm.input.v1` | Mouse movement, mouse buttons, scroll, and keyboard events (low latency, loss tolerant) |
+| Input | UDP `47834` | QUIC datagrams | `mykvm.input.v2` | Mouse movement, mouse buttons, precise scroll, gestures, and keyboard events (low latency, loss tolerant) |
 | Clipboard | UDP `47834` | QUIC streams | `mykvm.clipboard.v1` | Clipboard text and image sync (reliable, ordered) |
 
 The discovery port is configurable in Settings (default UDP `47833`); the QUIC transport port defaults to the discovery port + 1 (UDP `47834`). Both auto-fall-back through nearby ports if a port is taken, and can use a system-selected port if needed. Peers advertise their active discovery port, QUIC port, transport public key, and protocol version, so discovered and manually added devices connect to the right port and pin the right certificate.

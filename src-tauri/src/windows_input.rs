@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::shared_input::{mouse_button_mask, InputCommand, MouseButton};
+use crate::shared_input::{mouse_button_mask, GesturePhase, InputCommand, MouseButton};
 
 /// Explains a refused button/key injection, throttled to one line per 10s.
 ///
@@ -93,6 +93,23 @@ pub fn inject_command_without_tracking(command: &InputCommand) {
         InputCommand::MouseMove { x, y, .. } => inject_mouse_move(x, y, None),
         InputCommand::MouseButton { button, down, x, y } => inject_mouse_button(button, down, x, y),
         InputCommand::Scroll { delta_x, delta_y } => inject_scroll(delta_x, delta_y),
+        InputCommand::PreciseScroll {
+            delta_x,
+            delta_y,
+            phase,
+            momentum_phase,
+        } => inject_precise_scroll(delta_x, delta_y, phase, momentum_phase),
+        InputCommand::Swipe {
+            delta_x,
+            delta_y,
+            phase,
+        } => inject_swipe(delta_x, delta_y, phase),
+        InputCommand::Pinch {
+            magnification,
+            phase,
+            x,
+            y,
+        } => inject_pinch(magnification, phase, x, y),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
         InputCommand::ReleaseAll => {}
         InputCommand::SecureAttention => {
@@ -312,6 +329,10 @@ pub fn inject_mouse_button(button: MouseButton, down: bool, x: i32, y: i32) {
 }
 
 pub fn inject_scroll(delta_x: i32, delta_y: i32) {
+    inject_wheel_units(delta_x.saturating_mul(120), delta_y.saturating_mul(120));
+}
+
+fn inject_wheel_units(delta_x: i32, delta_y: i32) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     };
@@ -327,7 +348,11 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) {
                 mi: MOUSEINPUT {
                     dx: 0,
                     dy: 0,
-                    mouseData: (delta * 120) as u32,
+                    // Windows defines wheel data as a signed value stored in a
+                    // DWORD. Values smaller than WHEEL_DELTA (120) are legal
+                    // and are how high-resolution wheels preserve sub-notch
+                    // movement for applications that support it.
+                    mouseData: delta as u32,
                     dwFlags: flag,
                     time: 0,
                     dwExtraInfo: 0,
@@ -338,6 +363,337 @@ pub fn inject_scroll(delta_x: i32, delta_y: i32) {
         unsafe {
             let _ = SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
         }
+    }
+}
+
+#[derive(Default)]
+struct PreciseScrollRemainder {
+    x: f64,
+    y: f64,
+}
+
+// Conversion only; deltas remain fractional and are never snapped to 120.
+// Keep this in one place so physical testing can tune speed without touching
+// the protocol or macOS capture path.
+const WINDOWS_WHEEL_UNITS_PER_MAC_SCROLL_UNIT: f64 = 10.0;
+
+pub fn inject_precise_scroll(
+    delta_x: f64,
+    delta_y: f64,
+    phase: GesturePhase,
+    momentum_phase: GesturePhase,
+) {
+    static REMAINDER: OnceLock<Mutex<PreciseScrollRemainder>> = OnceLock::new();
+    let Ok(mut remainder) = REMAINDER
+        .get_or_init(|| Mutex::new(PreciseScrollRemainder::default()))
+        .lock()
+    else {
+        return;
+    };
+
+    remainder.x += delta_x * WINDOWS_WHEEL_UNITS_PER_MAC_SCROLL_UNIT;
+    remainder.y += delta_y * WINDOWS_WHEEL_UNITS_PER_MAC_SCROLL_UNIT;
+    let x = remainder.x.trunc() as i32;
+    let y = remainder.y.trunc() as i32;
+    remainder.x -= f64::from(x);
+    remainder.y -= f64::from(y);
+    inject_wheel_units(x, y);
+
+    if matches!(phase, GesturePhase::Cancelled) || matches!(momentum_phase, GesturePhase::Cancelled)
+    {
+        *remainder = PreciseScrollRemainder::default();
+    }
+}
+
+// Change this one constant if macOS natural-scroll direction should select the
+// opposite Windows virtual desktop. Vertical mappings remain unchanged.
+const REVERSE_HORIZONTAL_SWIPE: bool = false;
+const SWIPE_TRIGGER_DELTA: f64 = 0.35;
+
+#[derive(Default)]
+struct SwipeState {
+    x: f64,
+    y: f64,
+    triggered: bool,
+}
+
+pub fn inject_swipe(delta_x: f64, delta_y: f64, phase: GesturePhase) {
+    static STATE: OnceLock<Mutex<SwipeState>> = OnceLock::new();
+    let Ok(mut state) = STATE
+        .get_or_init(|| Mutex::new(SwipeState::default()))
+        .lock()
+    else {
+        return;
+    };
+    if matches!(phase, GesturePhase::Began) {
+        *state = SwipeState::default();
+    }
+    state.x += delta_x;
+    state.y += delta_y;
+
+    let ended = matches!(phase, GesturePhase::Ended | GesturePhase::Cancelled);
+    let over_threshold = state.x.abs().max(state.y.abs()) >= SWIPE_TRIGGER_DELTA;
+    if !state.triggered && (over_threshold || ended) {
+        if state.y.abs() > state.x.abs() {
+            if state.y > 0.0 {
+                inject_key_chord(&[0x5B, 0x09]); // Win + Tab
+            }
+            // Down-swipe is intentionally reserved for a future configurable action.
+        } else if state.x.abs() > f64::EPSILON {
+            let points_left = state.x < 0.0;
+            let windows_left = points_left ^ REVERSE_HORIZONTAL_SWIPE;
+            inject_key_chord(&[0x5B, 0x11, if windows_left { 0x25 } else { 0x27 }]);
+        }
+        state.triggered = true;
+    }
+    if ended {
+        *state = SwipeState::default();
+    }
+}
+
+fn inject_key_chord(keys: &[u16]) {
+    for key in keys {
+        inject_key(*key, true);
+    }
+    for key in keys.iter().rev() {
+        inject_key(*key, false);
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PointerInfo {
+    pointer_type: u32,
+    pointer_id: u32,
+    frame_id: u32,
+    pointer_flags: u32,
+    source_device: windows_sys::Win32::Foundation::HANDLE,
+    hwnd_target: windows_sys::Win32::Foundation::HWND,
+    pixel_location: windows_sys::Win32::Foundation::POINT,
+    himetric_location: windows_sys::Win32::Foundation::POINT,
+    pixel_location_raw: windows_sys::Win32::Foundation::POINT,
+    himetric_location_raw: windows_sys::Win32::Foundation::POINT,
+    time: u32,
+    history_count: u32,
+    input_data: i32,
+    key_states: u32,
+    performance_count: u64,
+    button_change_type: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PointerTouchInfo {
+    pointer_info: PointerInfo,
+    touch_flags: u32,
+    touch_mask: u32,
+    contact: windows_sys::Win32::Foundation::RECT,
+    contact_raw: windows_sys::Win32::Foundation::RECT,
+    orientation: u32,
+    pressure: u32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn InitializeTouchInjection(max_count: u32, feedback_mode: u32) -> i32;
+    fn InjectTouchInput(count: u32, contacts: *const PointerTouchInfo) -> i32;
+}
+
+const POINTER_INPUT_TYPE_TOUCH: u32 = 2;
+const POINTER_FLAG_INRANGE: u32 = 0x0000_0002;
+const POINTER_FLAG_INCONTACT: u32 = 0x0000_0004;
+const POINTER_FLAG_DOWN: u32 = 0x0001_0000;
+const POINTER_FLAG_UPDATE: u32 = 0x0002_0000;
+const POINTER_FLAG_UP: u32 = 0x0004_0000;
+const TOUCH_MASK_CONTACTAREA: u32 = 0x0000_0001;
+const TOUCH_MASK_ORIENTATION: u32 = 0x0000_0002;
+const TOUCH_MASK_PRESSURE: u32 = 0x0000_0004;
+const TOUCH_FEEDBACK_NONE: u32 = 0x0000_0003;
+
+struct PinchState {
+    initialization_attempted: bool,
+    touch_available: bool,
+    active: bool,
+    fallback: bool,
+    center_x: i32,
+    center_y: i32,
+    distance: f64,
+    fallback_remainder: f64,
+    last_points: [(i32, i32); 2],
+}
+
+impl Default for PinchState {
+    fn default() -> Self {
+        Self {
+            initialization_attempted: false,
+            touch_available: false,
+            active: false,
+            fallback: false,
+            center_x: 0,
+            center_y: 0,
+            distance: 80.0,
+            fallback_remainder: 0.0,
+            last_points: [(0, 0); 2],
+        }
+    }
+}
+
+pub fn inject_pinch(magnification: f64, phase: GesturePhase, x: i32, y: i32) {
+    static STATE: OnceLock<Mutex<PinchState>> = OnceLock::new();
+    let Ok(mut state) = STATE
+        .get_or_init(|| Mutex::new(PinchState::default()))
+        .lock()
+    else {
+        return;
+    };
+
+    if !state.active || matches!(phase, GesturePhase::Began) {
+        start_pinch(&mut state, x, y);
+    }
+
+    if state.fallback {
+        inject_pinch_fallback(&mut state, magnification);
+    } else if state.active && !matches!(phase, GesturePhase::Began) {
+        state.distance =
+            (state.distance * (1.0 + magnification).clamp(0.5, 1.5)).clamp(12.0, 500.0);
+        let points = pinch_points(state.center_x, state.center_y, state.distance);
+        if inject_touch_frame(
+            points,
+            POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_UPDATE,
+        ) {
+            state.last_points = points;
+        } else {
+            finish_touch_pinch(&mut state);
+            state.fallback = true;
+            state.active = true;
+            inject_pinch_fallback(&mut state, magnification);
+        }
+    }
+
+    if matches!(phase, GesturePhase::Ended | GesturePhase::Cancelled) {
+        if !state.fallback {
+            finish_touch_pinch(&mut state);
+        }
+        state.active = false;
+        state.fallback = false;
+        state.fallback_remainder = 0.0;
+    }
+}
+
+fn start_pinch(state: &mut PinchState, x: i32, y: i32) {
+    if !state.initialization_attempted {
+        state.initialization_attempted = true;
+        state.touch_available = unsafe { InitializeTouchInjection(2, TOUCH_FEEDBACK_NONE) } != 0;
+        if !state.touch_available {
+            log::info!("touch injection unavailable; pinch will use Ctrl+Wheel fallback");
+        }
+    }
+    state.center_x = x;
+    state.center_y = y;
+    state.distance = 80.0;
+    state.fallback_remainder = 0.0;
+    state.last_points = pinch_points(x, y, state.distance);
+    state.fallback = !state.touch_available
+        || !inject_touch_frame(
+            state.last_points,
+            POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
+        );
+    state.active = true;
+}
+
+fn finish_touch_pinch(state: &mut PinchState) {
+    if state.touch_available {
+        let _ = inject_touch_frame(state.last_points, POINTER_FLAG_INRANGE | POINTER_FLAG_UP);
+    }
+}
+
+fn pinch_points(center_x: i32, center_y: i32, distance: f64) -> [(i32, i32); 2] {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    let half = (distance / 2.0).round() as i32;
+    let (left, top, right, bottom) = unsafe {
+        let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        (
+            left,
+            top,
+            left + GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) - 1,
+            top + GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) - 1,
+        )
+    };
+    let contact_left = (left + 2).min(right);
+    let contact_right = (right - 2).max(contact_left);
+    let contact_top = (top + 2).min(bottom);
+    let contact_bottom = (bottom - 2).max(contact_top);
+    [
+        (
+            (center_x - half).clamp(contact_left, contact_right),
+            center_y.clamp(contact_top, contact_bottom),
+        ),
+        (
+            (center_x + half).clamp(contact_left, contact_right),
+            center_y.clamp(contact_top, contact_bottom),
+        ),
+    ]
+}
+
+fn inject_touch_frame(points: [(i32, i32); 2], flags: u32) -> bool {
+    let contacts = [
+        touch_contact(1, points[0].0, points[0].1, flags),
+        touch_contact(2, points[1].0, points[1].1, flags),
+    ];
+    unsafe { InjectTouchInput(contacts.len() as u32, contacts.as_ptr()) != 0 }
+}
+
+fn touch_contact(pointer_id: u32, x: i32, y: i32, flags: u32) -> PointerTouchInfo {
+    use windows_sys::Win32::Foundation::{POINT, RECT};
+
+    let point = POINT { x, y };
+    let contact = RECT {
+        left: x - 2,
+        top: y - 2,
+        right: x + 2,
+        bottom: y + 2,
+    };
+    PointerTouchInfo {
+        pointer_info: PointerInfo {
+            pointer_type: POINTER_INPUT_TYPE_TOUCH,
+            pointer_id,
+            frame_id: 0,
+            pointer_flags: flags,
+            source_device: std::ptr::null_mut(),
+            hwnd_target: std::ptr::null_mut(),
+            pixel_location: point,
+            himetric_location: POINT { x: 0, y: 0 },
+            pixel_location_raw: point,
+            himetric_location_raw: POINT { x: 0, y: 0 },
+            time: 0,
+            history_count: 0,
+            input_data: 0,
+            key_states: 0,
+            performance_count: 0,
+            button_change_type: 0,
+        },
+        touch_flags: 0,
+        touch_mask: TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE,
+        contact,
+        contact_raw: contact,
+        orientation: 90,
+        pressure: 32_000,
+    }
+}
+
+fn inject_pinch_fallback(state: &mut PinchState, magnification: f64) {
+    state.fallback_remainder += magnification * 1200.0;
+    let delta = state.fallback_remainder.trunc() as i32;
+    state.fallback_remainder -= f64::from(delta);
+    if delta != 0 {
+        inject_key(0x11, true); // Ctrl
+        inject_wheel_units(0, delta);
+        inject_key(0x11, false);
     }
 }
 

@@ -24,7 +24,9 @@ use quinn::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+// v2 adds precise-scroll and trackpad gesture input variants. Refuse mixed v1/v2
+// peers instead of silently dropping an enum variant an older receiver cannot decode.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 const SERVER_NAME: &str = "mykvm.local";
 const MAX_DATAGRAM_BYTES: usize = 16 * 1024;

@@ -8,6 +8,10 @@ release will reuse them).
 
 ## [Unreleased]
 
+### Added
+
+- Magic Trackpad input from a macOS controller now keeps high-resolution two-finger scrolling (including horizontal movement and momentum), maps four-finger swipes to Windows task/desktop shortcuts, and forwards pinch gestures through Windows touch injection with a Ctrl+wheel compatibility fallback.
+
 ### Fixed
 
 - Keyboard, mouse, and clipboard could fail to connect between machines — the QUIC handshake rejected the peer with `invalid peer certificate: BadSignature`. The transport now pins the device's advertised certificate directly instead of running brittle chain validation over a self-signed certificate, which fixes cross-platform (macOS ↔ Windows) handshakes.

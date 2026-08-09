@@ -13,10 +13,48 @@ pub const INPUT_SERVICE_DISPLAY_NAME: &str = "MyKVM Lock Screen Input Service";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputEvent {
-    MouseMove { screen_id: String, x: i32, y: i32 },
-    MouseButton { button: MouseButton, down: bool },
-    Scroll { delta_x: i32, delta_y: i32 },
-    Key { key_code: u16, down: bool },
+    MouseMove {
+        screen_id: String,
+        x: i32,
+        y: i32,
+    },
+    MouseButton {
+        button: MouseButton,
+        down: bool,
+    },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    PreciseScroll {
+        delta_x: f64,
+        delta_y: f64,
+        phase: GesturePhase,
+        momentum_phase: GesturePhase,
+    },
+    Swipe {
+        delta_x: f64,
+        delta_y: f64,
+        phase: GesturePhase,
+    },
+    Pinch {
+        magnification: f64,
+        phase: GesturePhase,
+    },
+    Key {
+        key_code: u16,
+        down: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GesturePhase {
+    None,
+    Began,
+    Changed,
+    Ended,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +85,23 @@ pub enum InputCommand {
     Scroll {
         delta_x: i32,
         delta_y: i32,
+    },
+    PreciseScroll {
+        delta_x: f64,
+        delta_y: f64,
+        phase: GesturePhase,
+        momentum_phase: GesturePhase,
+    },
+    Swipe {
+        delta_x: f64,
+        delta_y: f64,
+        phase: GesturePhase,
+    },
+    Pinch {
+        magnification: f64,
+        phase: GesturePhase,
+        x: i32,
+        y: i32,
     },
     Key {
         key_code: u16,
@@ -133,5 +188,34 @@ mod tests {
             decode_input_command(&framed[4..]).expect("decode input command"),
             command
         );
+    }
+
+    #[test]
+    fn trackpad_commands_round_trip() {
+        let commands = [
+            InputCommand::PreciseScroll {
+                delta_x: 0.375,
+                delta_y: -1.625,
+                phase: GesturePhase::Changed,
+                momentum_phase: GesturePhase::Began,
+            },
+            InputCommand::Swipe {
+                delta_x: -0.75,
+                delta_y: 0.0,
+                phase: GesturePhase::Ended,
+            },
+            InputCommand::Pinch {
+                magnification: 0.125,
+                phase: GesturePhase::Changed,
+                x: 640,
+                y: 480,
+            },
+        ];
+
+        for command in commands {
+            let framed = encode_input_command(&command).expect("encode trackpad command");
+            let decoded = decode_input_command(&framed[4..]).expect("decode trackpad command");
+            assert_eq!(decoded, command);
+        }
     }
 }
