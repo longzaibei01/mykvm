@@ -8,6 +8,8 @@ release will reuse them).
 
 ## [Unreleased]
 
+- Align the custom trackpad build's app version with upstream `v0.9.12` so the updater does not repeatedly offer the already-current upstream release.
+
 ### Added
 
 - Magic Trackpad input from a macOS controller now keeps high-resolution two-finger scrolling (including horizontal movement and momentum), maps four-finger swipes to Windows task/desktop shortcuts, and forwards pinch gestures through Windows touch injection with a Ctrl+wheel compatibility fallback.
