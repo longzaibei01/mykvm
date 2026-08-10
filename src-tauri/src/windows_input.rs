@@ -515,6 +515,7 @@ struct PinchState {
     touch_available: bool,
     active: bool,
     fallback: bool,
+    photoshop_fallback: bool,
     center_x: i32,
     center_y: i32,
     distance: f64,
@@ -529,6 +530,7 @@ impl Default for PinchState {
             touch_available: false,
             active: false,
             fallback: false,
+            photoshop_fallback: false,
             center_x: 0,
             center_y: 0,
             distance: 80.0,
@@ -576,6 +578,7 @@ pub fn inject_pinch(magnification: f64, phase: GesturePhase, x: i32, y: i32) {
         }
         state.active = false;
         state.fallback = false;
+        state.photoshop_fallback = false;
         state.fallback_remainder = 0.0;
     }
 }
@@ -593,7 +596,12 @@ fn start_pinch(state: &mut PinchState, x: i32, y: i32) {
     state.distance = 80.0;
     state.fallback_remainder = 0.0;
     state.last_points = pinch_points(x, y, state.distance);
-    state.fallback = !state.touch_available
+    state.photoshop_fallback = windows_foreground_process_is_photoshop();
+    if state.photoshop_fallback {
+        log::info!("Photoshop foreground detected; pinch will use Ctrl+Add/Subtract fallback");
+    }
+    state.fallback = state.photoshop_fallback
+        || !state.touch_available
         || !inject_touch_frame(
             state.last_points,
             POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN,
@@ -687,6 +695,20 @@ fn touch_contact(pointer_id: u32, x: i32, y: i32, flags: u32) -> PointerTouchInf
 }
 
 fn inject_pinch_fallback(state: &mut PinchState, magnification: f64) {
+    if state.photoshop_fallback {
+        const PHOTOSHOP_ZOOM_STEP: f64 = 0.04;
+        state.fallback_remainder += magnification;
+        while state.fallback_remainder.abs() >= PHOTOSHOP_ZOOM_STEP {
+            let zoom_in = state.fallback_remainder > 0.0;
+            inject_key_chord(&[0x11, if zoom_in { 0x6B } else { 0x6D }]);
+            state.fallback_remainder -= if zoom_in {
+                PHOTOSHOP_ZOOM_STEP
+            } else {
+                -PHOTOSHOP_ZOOM_STEP
+            };
+        }
+        return;
+    }
     state.fallback_remainder += magnification * 1200.0;
     let delta = state.fallback_remainder.trunc() as i32;
     state.fallback_remainder -= f64::from(delta);
@@ -695,6 +717,40 @@ fn inject_pinch_fallback(state: &mut PinchState, magnification: f64) {
         inject_wheel_units(0, delta);
         inject_key(0x11, false);
     }
+}
+
+fn windows_foreground_process_is_photoshop() -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, MAX_PATH},
+        System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+        UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
+    };
+
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_null() {
+        return false;
+    }
+    let mut process_id = 0_u32;
+    unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+    if process_id == 0 {
+        return false;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return false;
+    }
+    let mut path = [0_u16; MAX_PATH as usize];
+    let mut length = path.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut length) } != 0;
+    unsafe {
+        CloseHandle(process);
+    }
+    ok && String::from_utf16_lossy(&path[..length as usize])
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("photoshop"))
 }
 
 pub fn inject_key(key_code: u16, down: bool) {

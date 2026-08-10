@@ -59,6 +59,17 @@ const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
 const MACOS_SCROLL_PHASE_FIELD: u32 = 99;
 #[cfg(target_os = "macos")]
 const MACOS_MOMENTUM_PHASE_FIELD: u32 = 123;
+// Private AppKit gesture event numbers that are present in the WindowServer
+// stream on current macOS releases. We do not use them for recognition (raw
+// contacts are more reliable); the active tap only consumes the local copy
+// while the pointer is on a remote so Mission Control/Show Desktop does not
+// run on both machines.
+#[cfg(target_os = "macos")]
+const MACOS_PRIVATE_GESTURE_EVENT_TYPES: &[u32] = &[29, 30, 31, 32];
+#[cfg(target_os = "macos")]
+const MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+#[cfg(target_os = "macos")]
+const MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 #[cfg(target_os = "macos")]
 fn gesture_phase_from_nsevent_bits(bits: u64) -> GesturePhase {
     if bits & (1 << 4) != 0 {
@@ -859,6 +870,7 @@ fn start_platform_capture(
             local_y_bounds,
             display_snapshots,
             raw_trackpad_gesture: Mutex::new(MacRawTrackpadGestureState::default()),
+            raw_pinch_suppresses_scroll: AtomicBool::new(false),
         });
         let callback_context = Arc::clone(&context);
         let event_types = vec![
@@ -909,6 +921,25 @@ fn start_platform_capture(
             }
         };
         CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        let mut gesture_suppression_taps = Vec::new();
+        let mut _gesture_suppression_sources = Vec::new();
+        for location in [CGEventTapLocation::HID, CGEventTapLocation::Session] {
+            if let Ok(suppression_tap) =
+                MacosGestureSuppressionTap::new(location, Arc::clone(&context))
+            {
+                if let Ok(source) = suppression_tap.mach_port().create_runloop_source(0) {
+                    CFRunLoop::get_current()
+                        .add_source(&source, unsafe { kCFRunLoopCommonModes });
+                    suppression_tap.enable();
+                    _gesture_suppression_sources.push(source);
+                    gesture_suppression_taps.push(suppression_tap);
+                }
+            }
+        }
+        log::info!(
+            "[trackpad] local gesture suppression taps active={}",
+            gesture_suppression_taps.len()
+        );
         // CGEventTap masks accept CGEventType values only; AppKit's NSEvent
         // magnify/swipe values are a different enum and never arrive through a
         // Quartz tap. Read contact frames instead and recognize only the two
@@ -946,6 +977,9 @@ fn start_platform_capture(
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
                 tap.enable();
+                for suppression_tap in &gesture_suppression_taps {
+                    suppression_tap.enable();
+                }
                 log::debug!("[diag] event tap re-enabled after being disabled");
             }
             // While controlling a remote, macOS can re-associate the physical
@@ -2429,6 +2463,119 @@ struct MacCaptureContext {
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
     raw_trackpad_gesture: Mutex<MacRawTrackpadGestureState>,
+    raw_pinch_suppresses_scroll: AtomicBool,
+}
+
+#[cfg(target_os = "macos")]
+struct MacosGestureSuppressionTap {
+    mach_port: core_foundation::mach_port::CFMachPort,
+    _context: Arc<MacCaptureContext>,
+}
+
+#[cfg(target_os = "macos")]
+type MacosGestureSuppressionCallback = unsafe extern "C" fn(
+    core_graphics::event::CGEventTapProxy,
+    u32,
+    core_graphics::sys::CGEventRef,
+    *const std::ffi::c_void,
+) -> core_graphics::sys::CGEventRef;
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    #[link_name = "CGEventTapCreate"]
+    fn macos_gesture_suppression_tap_create(
+        tap: core_graphics::event::CGEventTapLocation,
+        place: core_graphics::event::CGEventTapPlacement,
+        options: core_graphics::event::CGEventTapOptions,
+        events_of_interest: u64,
+        callback: MacosGestureSuppressionCallback,
+        user_info: *const std::ffi::c_void,
+    ) -> core_foundation::mach_port::CFMachPortRef;
+
+    #[link_name = "CGEventTapEnable"]
+    fn macos_gesture_suppression_tap_enable(
+        tap: core_foundation::mach_port::CFMachPortRef,
+        enable: bool,
+    );
+}
+
+#[cfg(target_os = "macos")]
+impl MacosGestureSuppressionTap {
+    fn new(
+        location: core_graphics::event::CGEventTapLocation,
+        context: Arc<MacCaptureContext>,
+    ) -> Result<Self, ()> {
+        use core_foundation::{base::TCFType, mach_port::CFMachPort};
+        use core_graphics::event::{CGEventTapOptions, CGEventTapPlacement};
+
+        let mask = MACOS_PRIVATE_GESTURE_EVENT_TYPES
+            .iter()
+            .fold(0_u64, |mask, event_type| mask | (1_u64 << *event_type));
+        let mach_port = unsafe {
+            macos_gesture_suppression_tap_create(
+                location,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                mask,
+                macos_gesture_suppression_callback,
+                Arc::as_ptr(&context).cast(),
+            )
+        };
+        if mach_port.is_null() {
+            return Err(());
+        }
+        Ok(Self {
+            mach_port: unsafe { CFMachPort::wrap_under_create_rule(mach_port) },
+            _context: context,
+        })
+    }
+
+    fn mach_port(&self) -> &core_foundation::mach_port::CFMachPort {
+        &self.mach_port
+    }
+
+    fn enable(&self) {
+        use core_foundation::base::TCFType;
+        unsafe {
+            macos_gesture_suppression_tap_enable(self.mach_port.as_concrete_TypeRef(), true);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacosGestureSuppressionTap {
+    fn drop(&mut self) {
+        use core_foundation::{base::TCFType, mach_port::CFMachPortInvalidate};
+        unsafe {
+            CFMachPortInvalidate(self.mach_port.as_CFTypeRef() as *mut _);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn macos_gesture_suppression_callback(
+    _proxy: core_graphics::event::CGEventTapProxy,
+    event_type: u32,
+    event: core_graphics::sys::CGEventRef,
+    user_info: *const std::ffi::c_void,
+) -> core_graphics::sys::CGEventRef {
+    if user_info.is_null() {
+        return event;
+    }
+    let context = unsafe { &*(user_info as *const MacCaptureContext) };
+    if matches!(
+        event_type,
+        MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT | MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT
+    ) {
+        context.tap_disabled.store(true, Ordering::Relaxed);
+        return event;
+    }
+    if context.remote_active.load(Ordering::Relaxed) {
+        std::ptr::null_mut()
+    } else {
+        event
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2436,6 +2583,7 @@ struct MacCaptureContext {
 enum MacRawGestureKind {
     Swipe,
     Pinch,
+    FourFingerPinch,
 }
 
 #[cfg(target_os = "macos")]
@@ -2446,6 +2594,9 @@ struct MacRawTrackpadGestureState {
     previous_centroid: Option<(f64, f64)>,
     pinch_baseline: Option<f64>,
     pinch_previous: Option<f64>,
+    two_finger_centroid_baseline: Option<(f64, f64)>,
+    four_finger_centroid_baseline: Option<(f64, f64)>,
+    four_finger_spread_baseline: Option<f64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2672,17 +2823,22 @@ fn handle_macos_multitouch_frame(
     contacts: &[MacosMultitouchContact],
 ) {
     const SWIPE_SCALE: f64 = 2.5;
-    const PINCH_ACTIVATION_RATIO: f64 = 0.04;
+    const TWO_FINGER_PINCH_RATIO: f64 = 0.035;
+    const FOUR_FINGER_PINCH_RATIO: f64 = 0.06;
+    const FOUR_FINGER_SWIPE_DISTANCE: f64 = 0.025;
 
     let Ok(mut state) = context.raw_trackpad_gesture.lock() else {
         return;
     };
     if !context.remote_active.load(Ordering::Relaxed) {
         *state = MacRawTrackpadGestureState::default();
+        context
+            .raw_pinch_suppresses_scroll
+            .store(false, Ordering::Relaxed);
         return;
     }
 
-    let mut events = Vec::with_capacity(3);
+    let mut events = Vec::with_capacity(6);
     match contacts.len() {
         4 => {
             if state.active == Some(MacRawGestureKind::Pinch) {
@@ -2690,35 +2846,63 @@ fn handle_macos_multitouch_frame(
                     magnification: 0.0,
                     phase: GesturePhase::Ended,
                 });
+                context
+                    .raw_pinch_suppresses_scroll
+                    .store(false, Ordering::Relaxed);
             }
-            let centroid = contacts.iter().fold((0.0, 0.0), |sum, contact| {
-                (
-                    sum.0 + f64::from(contact.normalized.position.x),
-                    sum.1 + f64::from(contact.normalized.position.y),
-                )
-            });
-            let centroid = (centroid.0 / 4.0, centroid.1 / 4.0);
-            if state.active != Some(MacRawGestureKind::Swipe) || state.contact_count != 4 {
-                state.active = Some(MacRawGestureKind::Swipe);
+            let centroid = macos_contact_centroid(contacts);
+            let spread = macos_contact_spread(contacts, centroid).max(0.000_001);
+            if state.contact_count != 4 {
+                state.active = None;
                 state.previous_centroid = Some(centroid);
-                events.push(InputEvent::Swipe {
-                    delta_x: 0.0,
-                    delta_y: 0.0,
-                    phase: GesturePhase::Began,
-                });
-            } else if let Some(previous) = state.previous_centroid.replace(centroid) {
-                let delta_x = (centroid.0 - previous.0) * SWIPE_SCALE;
-                let delta_y = (centroid.1 - previous.1) * SWIPE_SCALE;
-                if delta_x.abs().max(delta_y.abs()) > 0.000_01 {
+                state.four_finger_centroid_baseline = Some(centroid);
+                state.four_finger_spread_baseline = Some(spread);
+            } else {
+                let centroid_baseline = state.four_finger_centroid_baseline.unwrap_or(centroid);
+                let spread_baseline = state.four_finger_spread_baseline.unwrap_or(spread);
+                let centroid_distance = point_distance(centroid, centroid_baseline);
+                let spread_change = spread / spread_baseline - 1.0;
+
+                if state.active.is_none()
+                    && spread_change.abs() >= FOUR_FINGER_PINCH_RATIO
+                    && spread_change.abs() > centroid_distance * 1.5
+                {
+                    state.active = Some(MacRawGestureKind::FourFingerPinch);
+                    if spread_change < 0.0 {
+                        push_windows_key_chord(&mut events, &[0x5B, 0x09]); // Win + Tab
+                        log::info!("[trackpad] four-finger pinch-in -> Win+Tab");
+                    } else {
+                        push_windows_key_chord(&mut events, &[0x5B, 0x44]); // Win + D
+                        log::info!("[trackpad] four-finger spread -> Win+D");
+                    }
+                } else if state.active.is_none()
+                    && centroid_distance >= FOUR_FINGER_SWIPE_DISTANCE
+                    && centroid_distance > spread_change.abs()
+                {
+                    state.active = Some(MacRawGestureKind::Swipe);
                     events.push(InputEvent::Swipe {
-                        delta_x,
-                        delta_y,
+                        delta_x: 0.0,
+                        delta_y: 0.0,
+                        phase: GesturePhase::Began,
+                    });
+                    events.push(InputEvent::Swipe {
+                        delta_x: (centroid.0 - centroid_baseline.0) * SWIPE_SCALE,
+                        delta_y: (centroid.1 - centroid_baseline.1) * SWIPE_SCALE,
+                        phase: GesturePhase::Changed,
+                    });
+                } else if state.active == Some(MacRawGestureKind::Swipe) {
+                    let previous = state.previous_centroid.unwrap_or(centroid);
+                    events.push(InputEvent::Swipe {
+                        delta_x: (centroid.0 - previous.0) * SWIPE_SCALE,
+                        delta_y: (centroid.1 - previous.1) * SWIPE_SCALE,
                         phase: GesturePhase::Changed,
                     });
                 }
+                state.previous_centroid = Some(centroid);
             }
             state.pinch_baseline = None;
             state.pinch_previous = None;
+            state.two_finger_centroid_baseline = None;
         }
         2 => {
             if state.active == Some(MacRawGestureKind::Swipe) {
@@ -2728,7 +2912,10 @@ fn handle_macos_multitouch_frame(
                     phase: GesturePhase::Ended,
                 });
                 state.active = None;
+            } else if state.active == Some(MacRawGestureKind::FourFingerPinch) {
+                state.active = None;
             }
+            let centroid = macos_contact_centroid(contacts);
             let dx = f64::from(
                 contacts[0].normalized.position.x - contacts[1].normalized.position.x,
             );
@@ -2739,26 +2926,47 @@ fn handle_macos_multitouch_frame(
             if state.contact_count != 2 {
                 state.pinch_baseline = Some(distance);
                 state.pinch_previous = Some(distance);
+                state.two_finger_centroid_baseline = Some(centroid);
             }
             let baseline = state.pinch_baseline.unwrap_or(distance);
             let previous = state.pinch_previous.replace(distance).unwrap_or(distance);
+            let centroid_baseline = state.two_finger_centroid_baseline.unwrap_or(centroid);
+            let translation = point_distance(centroid, centroid_baseline);
+            let scale_change = distance / baseline - 1.0;
             if state.active == Some(MacRawGestureKind::Pinch) {
+                context
+                    .raw_pinch_suppresses_scroll
+                    .store(true, Ordering::Relaxed);
                 events.push(InputEvent::Pinch {
                     magnification: distance / previous - 1.0,
                     phase: GesturePhase::Changed,
                 });
-            } else if (distance / baseline - 1.0).abs() >= PINCH_ACTIVATION_RATIO {
+            } else if scale_change.abs() >= TWO_FINGER_PINCH_RATIO
+                && scale_change.abs() > translation * 1.25
+            {
                 state.active = Some(MacRawGestureKind::Pinch);
+                context
+                    .raw_pinch_suppresses_scroll
+                    .store(true, Ordering::Relaxed);
                 events.push(InputEvent::Pinch {
                     magnification: 0.0,
                     phase: GesturePhase::Began,
                 });
                 events.push(InputEvent::Pinch {
-                    magnification: distance / baseline - 1.0,
+                    magnification: scale_change,
                     phase: GesturePhase::Changed,
                 });
+            } else if translation >= 0.025 && scale_change.abs() < translation * 0.6 {
+                // This is a two-finger translation (scroll), not a pinch. Rebase
+                // periodically so small spacing drift cannot accumulate into a
+                // false pinch after a long scroll.
+                state.pinch_baseline = Some(distance);
+                state.pinch_previous = Some(distance);
+                state.two_finger_centroid_baseline = Some(centroid);
             }
             state.previous_centroid = None;
+            state.four_finger_centroid_baseline = None;
+            state.four_finger_spread_baseline = None;
         }
         _ => {
             match state.active.take() {
@@ -2771,11 +2979,18 @@ fn handle_macos_multitouch_frame(
                     magnification: 0.0,
                     phase: GesturePhase::Ended,
                 }),
+                Some(MacRawGestureKind::FourFingerPinch) => {}
                 None => {}
             }
+            context
+                .raw_pinch_suppresses_scroll
+                .store(false, Ordering::Relaxed);
             state.previous_centroid = None;
             state.pinch_baseline = None;
             state.pinch_previous = None;
+            state.two_finger_centroid_baseline = None;
+            state.four_finger_centroid_baseline = None;
+            state.four_finger_spread_baseline = None;
         }
     }
     state.contact_count = contacts.len();
@@ -2783,6 +2998,61 @@ fn handle_macos_multitouch_frame(
 
     for event in events {
         send_macos_trackpad_gesture(context, event);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_contact_centroid(contacts: &[MacosMultitouchContact]) -> (f64, f64) {
+    let sum = contacts.iter().fold((0.0, 0.0), |sum, contact| {
+        (
+            sum.0 + f64::from(contact.normalized.position.x),
+            sum.1 + f64::from(contact.normalized.position.y),
+        )
+    });
+    let count = contacts.len().max(1) as f64;
+    (sum.0 / count, sum.1 / count)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_contact_spread(
+    contacts: &[MacosMultitouchContact],
+    centroid: (f64, f64),
+) -> f64 {
+    contacts
+        .iter()
+        .map(|contact| {
+            point_distance(
+                (
+                    f64::from(contact.normalized.position.x),
+                    f64::from(contact.normalized.position.y),
+                ),
+                centroid,
+            )
+        })
+        .sum::<f64>()
+        / contacts.len().max(1) as f64
+}
+
+#[cfg(target_os = "macos")]
+fn point_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let dx = a.0 - b.0;
+    let dy = a.1 - b.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
+#[cfg(target_os = "macos")]
+fn push_windows_key_chord(events: &mut Vec<InputEvent>, keys: &[u16]) {
+    for key_code in keys {
+        events.push(InputEvent::Key {
+            key_code: *key_code,
+            down: true,
+        });
+    }
+    for key_code in keys.iter().rev() {
+        events.push(InputEvent::Key {
+            key_code: *key_code,
+            down: false,
+        });
     }
 }
 
@@ -3734,6 +4004,13 @@ fn handle_macos_event(
             send_macos_mouse_button(context, &active_target, MouseButton::Middle, false)
         }
         CGEventType::ScrollWheel => {
+            if context
+                .raw_pinch_suppresses_scroll
+                .load(Ordering::Relaxed)
+            {
+                repin_macos_cursor_while_remote(context);
+                return CallbackResult::Drop;
+            }
             if !send_remote_mouse_move(
                 &context.quic_transport,
                 &active_target,
