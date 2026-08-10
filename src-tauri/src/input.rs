@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         mpsc, Arc, Mutex, OnceLock, TryLockError,
     },
     thread,
@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     quic_transport,
     shared_input::{
-        button_from_mask, mouse_button_mask, GesturePhase, InputCommand, InputEvent, MouseButton,
-        LEFT_BUTTON_MASK, MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK,
+        button_from_mask, mouse_button_mask, GestureAction, GesturePhase, InputCommand, InputEvent,
+        MouseButton, LEFT_BUTTON_MASK, MIDDLE_BUTTON_MASK, RIGHT_BUTTON_MASK,
     },
     Device, LayoutState, NativeStageStatus, Screen,
 };
@@ -869,8 +869,10 @@ fn start_platform_capture(
             local_screen_points: Mutex::new(HashMap::new()),
             local_y_bounds,
             display_snapshots,
-            raw_trackpad_gesture: Mutex::new(MacRawTrackpadGestureState::default()),
-            raw_pinch_suppresses_scroll: AtomicBool::new(false),
+            raw_trackpad_gestures: Mutex::new(HashMap::new()),
+            raw_trackpad_device: AtomicU64::new(0),
+            raw_two_finger_mode: AtomicU8::new(TWO_FINGER_MODE_NONE),
+            pending_trackpad_scroll: Mutex::new(Vec::new()),
         });
         let callback_context = Arc::clone(&context);
         let event_types = vec![
@@ -2277,6 +2279,7 @@ fn input_event_to_command(
                 y,
             })
         }
+        InputEvent::GestureAction { action } => Some(InputCommand::GestureAction { action }),
         InputEvent::Key { key_code, down } => Some(InputCommand::Key { key_code, down }),
     }
 }
@@ -2303,6 +2306,7 @@ fn inject_input_command(command: InputCommand) {
             x,
             y,
         } => inject_pinch(magnification, phase, x, y),
+        InputCommand::GestureAction { action } => inject_gesture_action(action),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
         InputCommand::ReleaseAll | InputCommand::SecureAttention => {}
     }
@@ -2462,8 +2466,10 @@ struct MacCaptureContext {
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
-    raw_trackpad_gesture: Mutex<MacRawTrackpadGestureState>,
-    raw_pinch_suppresses_scroll: AtomicBool,
+    raw_trackpad_gestures: Mutex<HashMap<u64, MacRawTrackpadGestureState>>,
+    raw_trackpad_device: AtomicU64,
+    raw_two_finger_mode: AtomicU8,
+    pending_trackpad_scroll: Mutex<Vec<InputEvent>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2583,6 +2589,7 @@ unsafe extern "C" fn macos_gesture_suppression_callback(
 enum MacRawGestureKind {
     Swipe,
     Pinch,
+    TwoFingerScroll,
     FourFingerPinch,
 }
 
@@ -2597,7 +2604,18 @@ struct MacRawTrackpadGestureState {
     two_finger_centroid_baseline: Option<(f64, f64)>,
     four_finger_centroid_baseline: Option<(f64, f64)>,
     four_finger_spread_baseline: Option<f64>,
+    two_finger_consistent_scale_frames: u8,
+    two_finger_scale_direction: i8,
 }
+
+#[cfg(target_os = "macos")]
+const TWO_FINGER_MODE_NONE: u8 = 0;
+#[cfg(target_os = "macos")]
+const TWO_FINGER_MODE_PENDING: u8 = 1;
+#[cfg(target_os = "macos")]
+const TWO_FINGER_MODE_SCROLL: u8 = 2;
+#[cfg(target_os = "macos")]
+const TWO_FINGER_MODE_PINCH: u8 = 3;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -2796,7 +2814,7 @@ impl Drop for MacosMultitouchCapture {
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" fn macos_multitouch_contact_callback(
-    _device: *mut std::ffi::c_void,
+    device: *mut std::ffi::c_void,
     contacts: *const MacosMultitouchContact,
     contact_count: i32,
     _timestamp: f64,
@@ -2813,13 +2831,14 @@ unsafe extern "C" fn macos_multitouch_contact_callback(
         return 0;
     };
     let contacts = unsafe { std::slice::from_raw_parts(contacts, contact_count as usize) };
-    handle_macos_multitouch_frame(&context, contacts);
+    handle_macos_multitouch_frame(&context, device as usize as u64, contacts);
     0
 }
 
 #[cfg(target_os = "macos")]
 fn handle_macos_multitouch_frame(
     context: &MacCaptureContext,
+    device: u64,
     contacts: &[MacosMultitouchContact],
 ) {
     const SWIPE_SCALE: f64 = 2.5;
@@ -2827,14 +2846,23 @@ fn handle_macos_multitouch_frame(
     const FOUR_FINGER_PINCH_RATIO: f64 = 0.06;
     const FOUR_FINGER_SWIPE_DISTANCE: f64 = 0.025;
 
-    let Ok(mut state) = context.raw_trackpad_gesture.lock() else {
+    let Ok(mut states) = context.raw_trackpad_gestures.lock() else {
         return;
     };
+    let state = states.entry(device).or_default();
     if !context.remote_active.load(Ordering::Relaxed) {
         *state = MacRawTrackpadGestureState::default();
-        context
-            .raw_pinch_suppresses_scroll
-            .store(false, Ordering::Relaxed);
+        context.raw_two_finger_mode.store(TWO_FINGER_MODE_NONE, Ordering::Relaxed);
+        context.raw_trackpad_device.store(0, Ordering::Relaxed);
+        return;
+    }
+
+    // MultitouchSupport reports frames independently for every registered
+    // trackpad. An idle built-in trackpad must not reset a gesture that is in
+    // progress on the external Magic Trackpad.
+    if !contacts.is_empty() {
+        context.raw_trackpad_device.store(device, Ordering::Relaxed);
+    } else if context.raw_trackpad_device.load(Ordering::Relaxed) != device {
         return;
     }
 
@@ -2846,9 +2874,7 @@ fn handle_macos_multitouch_frame(
                     magnification: 0.0,
                     phase: GesturePhase::Ended,
                 });
-                context
-                    .raw_pinch_suppresses_scroll
-                    .store(false, Ordering::Relaxed);
+                context.raw_two_finger_mode.store(TWO_FINGER_MODE_NONE, Ordering::Relaxed);
             }
             let centroid = macos_contact_centroid(contacts);
             let spread = macos_contact_spread(contacts, centroid).max(0.000_001);
@@ -2869,10 +2895,14 @@ fn handle_macos_multitouch_frame(
                 {
                     state.active = Some(MacRawGestureKind::FourFingerPinch);
                     if spread_change < 0.0 {
-                        push_windows_key_chord(&mut events, &[0x5B, 0x09]); // Win + Tab
+                        events.push(InputEvent::GestureAction {
+                            action: GestureAction::TaskView,
+                        });
                         log::info!("[trackpad] four-finger pinch-in -> Win+Tab");
                     } else {
-                        push_windows_key_chord(&mut events, &[0x5B, 0x44]); // Win + D
+                        events.push(InputEvent::GestureAction {
+                            action: GestureAction::ShowDesktop,
+                        });
                         log::info!("[trackpad] four-finger spread -> Win+D");
                     }
                 } else if state.active.is_none()
@@ -2927,27 +2957,54 @@ fn handle_macos_multitouch_frame(
                 state.pinch_baseline = Some(distance);
                 state.pinch_previous = Some(distance);
                 state.two_finger_centroid_baseline = Some(centroid);
+                state.two_finger_consistent_scale_frames = 0;
+                state.two_finger_scale_direction = 0;
+                context
+                    .raw_two_finger_mode
+                    .store(TWO_FINGER_MODE_PENDING, Ordering::Relaxed);
+                if let Ok(mut pending) = context.pending_trackpad_scroll.lock() {
+                    pending.clear();
+                }
             }
             let baseline = state.pinch_baseline.unwrap_or(distance);
             let previous = state.pinch_previous.replace(distance).unwrap_or(distance);
             let centroid_baseline = state.two_finger_centroid_baseline.unwrap_or(centroid);
             let translation = point_distance(centroid, centroid_baseline);
             let scale_change = distance / baseline - 1.0;
+            let radial_change = (distance - baseline).abs();
+            let scale_direction = if scale_change > 0.0 {
+                1
+            } else if scale_change < 0.0 {
+                -1
+            } else {
+                0
+            };
+            if scale_direction != 0 && scale_direction == state.two_finger_scale_direction {
+                state.two_finger_consistent_scale_frames =
+                    state.two_finger_consistent_scale_frames.saturating_add(1);
+            } else {
+                state.two_finger_scale_direction = scale_direction;
+                state.two_finger_consistent_scale_frames = u8::from(scale_direction != 0);
+            }
             if state.active == Some(MacRawGestureKind::Pinch) {
-                context
-                    .raw_pinch_suppresses_scroll
-                    .store(true, Ordering::Relaxed);
+                context.raw_two_finger_mode.store(TWO_FINGER_MODE_PINCH, Ordering::Relaxed);
                 events.push(InputEvent::Pinch {
                     magnification: distance / previous - 1.0,
                     phase: GesturePhase::Changed,
                 });
+            } else if state.active == Some(MacRawGestureKind::TwoFingerScroll) {
+                context
+                    .raw_two_finger_mode
+                    .store(TWO_FINGER_MODE_SCROLL, Ordering::Relaxed);
             } else if scale_change.abs() >= TWO_FINGER_PINCH_RATIO
-                && scale_change.abs() > translation * 1.25
+                && radial_change > translation * 1.5
+                && state.two_finger_consistent_scale_frames >= 3
             {
                 state.active = Some(MacRawGestureKind::Pinch);
-                context
-                    .raw_pinch_suppresses_scroll
-                    .store(true, Ordering::Relaxed);
+                context.raw_two_finger_mode.store(TWO_FINGER_MODE_PINCH, Ordering::Relaxed);
+                if let Ok(mut pending) = context.pending_trackpad_scroll.lock() {
+                    pending.clear();
+                }
                 events.push(InputEvent::Pinch {
                     magnification: 0.0,
                     phase: GesturePhase::Began,
@@ -2956,13 +3013,19 @@ fn handle_macos_multitouch_frame(
                     magnification: scale_change,
                     phase: GesturePhase::Changed,
                 });
-            } else if translation >= 0.025 && scale_change.abs() < translation * 0.6 {
-                // This is a two-finger translation (scroll), not a pinch. Rebase
-                // periodically so small spacing drift cannot accumulate into a
-                // false pinch after a long scroll.
-                state.pinch_baseline = Some(distance);
-                state.pinch_previous = Some(distance);
-                state.two_finger_centroid_baseline = Some(centroid);
+            } else if (translation >= 0.008 && translation > radial_change * 1.15)
+                || translation >= 0.018
+            {
+                // Lock the gesture as scroll until the fingers lift. This is
+                // what prevents spacing drift during a long scroll from later
+                // being reclassified as pinch.
+                state.active = Some(MacRawGestureKind::TwoFingerScroll);
+                context
+                    .raw_two_finger_mode
+                    .store(TWO_FINGER_MODE_SCROLL, Ordering::Relaxed);
+                if let Ok(mut pending) = context.pending_trackpad_scroll.lock() {
+                    events.extend(pending.drain(..));
+                }
             }
             state.previous_centroid = None;
             state.four_finger_centroid_baseline = None;
@@ -2980,11 +3043,16 @@ fn handle_macos_multitouch_frame(
                     phase: GesturePhase::Ended,
                 }),
                 Some(MacRawGestureKind::FourFingerPinch) => {}
+                Some(MacRawGestureKind::TwoFingerScroll) => {}
                 None => {}
             }
-            context
-                .raw_pinch_suppresses_scroll
-                .store(false, Ordering::Relaxed);
+            if context.raw_two_finger_mode.load(Ordering::Relaxed) == TWO_FINGER_MODE_PENDING {
+                if let Ok(mut pending) = context.pending_trackpad_scroll.lock() {
+                    events.extend(pending.drain(..));
+                }
+            }
+            context.raw_two_finger_mode.store(TWO_FINGER_MODE_NONE, Ordering::Relaxed);
+            context.raw_trackpad_device.store(0, Ordering::Relaxed);
             state.previous_centroid = None;
             state.pinch_baseline = None;
             state.pinch_previous = None;
@@ -2994,7 +3062,7 @@ fn handle_macos_multitouch_frame(
         }
     }
     state.contact_count = contacts.len();
-    drop(state);
+    drop(states);
 
     for event in events {
         send_macos_trackpad_gesture(context, event);
@@ -3041,22 +3109,6 @@ fn point_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 #[cfg(target_os = "macos")]
-fn push_windows_key_chord(events: &mut Vec<InputEvent>, keys: &[u16]) {
-    for key_code in keys {
-        events.push(InputEvent::Key {
-            key_code: *key_code,
-            down: true,
-        });
-    }
-    for key_code in keys.iter().rev() {
-        events.push(InputEvent::Key {
-            key_code: *key_code,
-            down: false,
-        });
-    }
-}
-
-#[cfg(target_os = "macos")]
 fn send_macos_trackpad_gesture(context: &MacCaptureContext, event: InputEvent) {
     let phase = match &event {
         InputEvent::Swipe { phase, .. } | InputEvent::Pinch { phase, .. } => *phase,
@@ -3065,6 +3117,7 @@ fn send_macos_trackpad_gesture(context: &MacCaptureContext, event: InputEvent) {
     let kind = match &event {
         InputEvent::Swipe { .. } => "four-finger swipe",
         InputEvent::Pinch { .. } => "two-finger pinch",
+        InputEvent::GestureAction { .. } => "four-finger action",
         _ => "gesture",
     };
     let target = context
@@ -4004,10 +4057,8 @@ fn handle_macos_event(
             send_macos_mouse_button(context, &active_target, MouseButton::Middle, false)
         }
         CGEventType::ScrollWheel => {
-            if context
-                .raw_pinch_suppresses_scroll
-                .load(Ordering::Relaxed)
-            {
+            let two_finger_mode = context.raw_two_finger_mode.load(Ordering::Relaxed);
+            if two_finger_mode == TWO_FINGER_MODE_PINCH {
                 repin_macos_cursor_while_remote(context);
                 return CallbackResult::Drop;
             }
@@ -4047,6 +4098,19 @@ fn handle_macos_event(
                         as i32,
                 }
             };
+            if two_finger_mode == TWO_FINGER_MODE_PENDING {
+                if let Ok(mut pending) = context.pending_trackpad_scroll.lock() {
+                    // A classification decision normally takes only a few raw
+                    // frames. Keep a hard cap in case the private callback
+                    // stalls, favouring current input over unbounded latency.
+                    if pending.len() >= 32 {
+                        pending.remove(0);
+                    }
+                    pending.push(scroll_event);
+                }
+                repin_macos_cursor_while_remote(context);
+                return CallbackResult::Drop;
+            }
             send_packet(
                 &context.quic_transport,
                 &target,
@@ -6506,6 +6570,19 @@ fn inject_swipe(delta_x: f64, delta_y: f64, phase: GesturePhase) {
 #[cfg(target_os = "windows")]
 fn inject_pinch(magnification: f64, phase: GesturePhase, x: i32, y: i32) {
     crate::windows_input::inject_pinch(magnification, phase, x, y);
+}
+
+fn inject_gesture_action(action: GestureAction) {
+    let keys: &[u16] = match action {
+        GestureAction::TaskView => &[0x5B, 0x09],
+        GestureAction::ShowDesktop => &[0x5B, 0x44],
+    };
+    for key in keys {
+        inject_key(*key, true);
+    }
+    for key in keys.iter().rev() {
+        inject_key(*key, false);
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -41,6 +41,9 @@ pub enum InputEvent {
         magnification: f64,
         phase: GesturePhase,
     },
+    GestureAction {
+        action: GestureAction,
+    },
     Key {
         key_code: u16,
         down: bool,
@@ -55,6 +58,13 @@ pub enum GesturePhase {
     Changed,
     Ended,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GestureAction {
+    TaskView,
+    ShowDesktop,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +112,9 @@ pub enum InputCommand {
         phase: GesturePhase,
         x: i32,
         y: i32,
+    },
+    GestureAction {
+        action: GestureAction,
     },
     Key {
         key_code: u16,
@@ -209,6 +222,9 @@ mod tests {
                 phase: GesturePhase::Changed,
                 x: 640,
                 y: 480,
+            },
+            InputCommand::GestureAction {
+                action: GestureAction::TaskView,
             },
         ];
 

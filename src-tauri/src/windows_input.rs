@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::shared_input::{mouse_button_mask, GesturePhase, InputCommand, MouseButton};
+use crate::shared_input::{
+    mouse_button_mask, GestureAction, GesturePhase, InputCommand, MouseButton,
+};
 
 /// Explains a refused button/key injection, throttled to one line per 10s.
 ///
@@ -110,11 +112,19 @@ pub fn inject_command_without_tracking(command: &InputCommand) {
             x,
             y,
         } => inject_pinch(magnification, phase, x, y),
+        InputCommand::GestureAction { action } => inject_gesture_action(action),
         InputCommand::Key { key_code, down } => inject_key(key_code, down),
         InputCommand::ReleaseAll => {}
         InputCommand::SecureAttention => {
             let _ = send_secure_attention();
         }
+    }
+}
+
+fn inject_gesture_action(action: GestureAction) {
+    match action {
+        GestureAction::TaskView => inject_key_chord(&[0x5B, 0x09]),
+        GestureAction::ShowDesktop => inject_key_chord(&[0x5B, 0x44]),
     }
 }
 
