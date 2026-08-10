@@ -53,56 +53,12 @@ const MACOS_VISIBLE_REMOTE_CAPTURE_LOOP_MS: u64 = 16;
 const MACOS_HIDDEN_REMOTE_CAPTURE_LOOP_MS: u64 = 50;
 #[cfg(target_os = "macos")]
 const MACOS_HIDDEN_WINDOW_CURSOR_HIDE_REASSERT_MS: u64 = 250;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_SYSTEM_DEFINED: u32 = 14;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_ROTATE: u32 = 18;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_BEGIN_GESTURE: u32 = 19;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_END_GESTURE: u32 = 20;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_GESTURE: u32 = 29;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_MAGNIFY: u32 = 30;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_SWIPE: u32 = 31;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_SMART_MAGNIFY: u32 = 32;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_QUICK_LOOK: u32 = 33;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_PRESSURE: u32 = 34;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_DIRECT_TOUCH: u32 = 37;
-#[cfg(target_os = "macos")]
-const MACOS_NSEVENT_TYPE_CHANGE_MODE: u32 = 38;
 // Public CGEventField numeric values that core-graphics 0.25 does not expose.
 // See CGEventField.scrollWheelEventScrollPhase / momentumPhase.
 #[cfg(target_os = "macos")]
 const MACOS_SCROLL_PHASE_FIELD: u32 = 99;
 #[cfg(target_os = "macos")]
 const MACOS_MOMENTUM_PHASE_FIELD: u32 = 123;
-#[cfg(target_os = "macos")]
-const MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
-#[cfg(target_os = "macos")]
-const MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
-#[cfg(target_os = "macos")]
-const MACOS_RAW_GESTURE_EVENT_TYPES: &[u32] = &[
-    MACOS_NSEVENT_TYPE_SYSTEM_DEFINED,
-    MACOS_NSEVENT_TYPE_ROTATE,
-    MACOS_NSEVENT_TYPE_BEGIN_GESTURE,
-    MACOS_NSEVENT_TYPE_END_GESTURE,
-    MACOS_NSEVENT_TYPE_GESTURE,
-    MACOS_NSEVENT_TYPE_MAGNIFY,
-    MACOS_NSEVENT_TYPE_SWIPE,
-    MACOS_NSEVENT_TYPE_SMART_MAGNIFY,
-    MACOS_NSEVENT_TYPE_QUICK_LOOK,
-    MACOS_NSEVENT_TYPE_PRESSURE,
-    MACOS_NSEVENT_TYPE_DIRECT_TOUCH,
-    MACOS_NSEVENT_TYPE_CHANGE_MODE,
-];
-
 #[cfg(target_os = "macos")]
 fn gesture_phase_from_nsevent_bits(bits: u64) -> GesturePhase {
     if bits & (1 << 4) != 0 {
@@ -902,6 +858,7 @@ fn start_platform_capture(
             local_screen_points: Mutex::new(HashMap::new()),
             local_y_bounds,
             display_snapshots,
+            raw_trackpad_gesture: Mutex::new(MacRawTrackpadGestureState::default()),
         });
         let callback_context = Arc::clone(&context);
         let event_types = vec![
@@ -952,33 +909,18 @@ fn start_platform_capture(
             }
         };
         CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
-        let mut raw_gesture_taps = Vec::new();
-        let mut _raw_gesture_loop_sources = Vec::new();
-        for location in [CGEventTapLocation::HID, CGEventTapLocation::Session] {
-            match RawMacosGestureTap::new(location, Arc::clone(&context)) {
-                Ok(raw_tap) => match raw_tap.mach_port().create_runloop_source(0) {
-                    Ok(source) => {
-                        CFRunLoop::get_current()
-                            .add_source(&source, unsafe { kCFRunLoopCommonModes });
-                        raw_tap.enable();
-                        _raw_gesture_loop_sources.push(source);
-                        raw_gesture_taps.push(raw_tap);
-                    }
-                    Err(_) => {
-                        log::warn!(
-                            "failed to attach raw macOS gesture event tap {:?} to run loop",
-                            location
-                        );
-                    }
-                },
-                Err(_) => {
-                    log::warn!(
-                        "failed to create raw macOS gesture event tap {:?}",
-                        location
-                    );
-                }
+        // CGEventTap masks accept CGEventType values only; AppKit's NSEvent
+        // magnify/swipe values are a different enum and never arrive through a
+        // Quartz tap. Read contact frames instead and recognize only the two
+        // gestures MyKVM needs. Mouse events stay on the existing tap, so the
+        // user's three-finger drag and four-finger middle-click are untouched.
+        let _multitouch_capture = match MacosMultitouchCapture::new(Arc::clone(&context)) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                log::warn!("trackpad gesture capture unavailable: {error}");
+                None
             }
-        }
+        };
         tap.enable();
         let _ = ready_tx.send(Ok(()));
         let mut app_nap_suppressed = false;
@@ -1004,9 +946,6 @@ fn start_platform_capture(
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
                 tap.enable();
-                for raw_tap in &raw_gesture_taps {
-                    raw_tap.enable();
-                }
                 log::debug!("[diag] event tap re-enabled after being disabled");
             }
             // While controlling a remote, macOS can re-associate the physical
@@ -2489,229 +2428,399 @@ struct MacCaptureContext {
     local_screen_points: Mutex<HashMap<String, (f64, f64)>>,
     local_y_bounds: Option<(f64, f64)>,
     display_snapshots: Vec<MacDisplaySnapshot>,
+    raw_trackpad_gesture: Mutex<MacRawTrackpadGestureState>,
 }
 
 #[cfg(target_os = "macos")]
-struct RawMacosGestureTap {
-    mach_port: core_foundation::mach_port::CFMachPort,
-    _context: Arc<MacCaptureContext>,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacRawGestureKind {
+    Swipe,
+    Pinch,
 }
 
 #[cfg(target_os = "macos")]
-impl RawMacosGestureTap {
-    fn new(
-        location: core_graphics::event::CGEventTapLocation,
-        context: Arc<MacCaptureContext>,
-    ) -> Result<Self, ()> {
-        use core_foundation::base::TCFType;
-        use core_foundation::mach_port::CFMachPort;
-        use core_graphics::event::{CGEventTapOptions, CGEventTapPlacement};
+#[derive(Default)]
+struct MacRawTrackpadGestureState {
+    active: Option<MacRawGestureKind>,
+    contact_count: usize,
+    previous_centroid: Option<(f64, f64)>,
+    pinch_baseline: Option<f64>,
+    pinch_previous: Option<f64>,
+}
 
-        let mach_port = unsafe {
-            macos_raw_event_tap_create(
-                location,
-                CGEventTapPlacement::HeadInsertEventTap,
-                CGEventTapOptions::Default,
-                macos_raw_gesture_event_mask(),
-                macos_raw_gesture_event_callback,
-                Arc::as_ptr(&context).cast(),
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacosMultitouchPoint {
+    x: f32,
+    y: f32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacosMultitouchReadout {
+    position: MacosMultitouchPoint,
+    velocity: MacosMultitouchPoint,
+}
+
+// Layout used by MultitouchSupport's contact-frame callback. We intentionally
+// read only `normalized.position`; the remaining fields keep the ABI offsets
+// correct across the macOS versions supported by this build.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MacosMultitouchContact {
+    frame: i32,
+    timestamp: f64,
+    identifier: i32,
+    state: i32,
+    finger_number: i32,
+    hand_id: i32,
+    normalized: MacosMultitouchReadout,
+    size: f32,
+    zero1: i32,
+    angle: f32,
+    major_axis: f32,
+    minor_axis: f32,
+    millimeters: MacosMultitouchReadout,
+    zero2: [i32; 2],
+    unknown: f32,
+}
+
+#[cfg(target_os = "macos")]
+type MacosMultitouchCallback = unsafe extern "C" fn(
+    *mut std::ffi::c_void,
+    *const MacosMultitouchContact,
+    i32,
+    f64,
+    i32,
+) -> i32;
+
+#[cfg(target_os = "macos")]
+type MacosMtRegister =
+    unsafe extern "C" fn(*mut std::ffi::c_void, MacosMultitouchCallback);
+#[cfg(target_os = "macos")]
+type MacosMtUnregister =
+    unsafe extern "C" fn(*mut std::ffi::c_void, MacosMultitouchCallback);
+#[cfg(target_os = "macos")]
+type MacosMtStart = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+#[cfg(target_os = "macos")]
+type MacosMtStop = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
+
+#[cfg(target_os = "macos")]
+static MACOS_MULTITOUCH_CONTEXT: OnceLock<Mutex<Option<Arc<MacCaptureContext>>>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+struct MacosMultitouchCapture {
+    library: *mut std::ffi::c_void,
+    device_array: *const std::ffi::c_void,
+    devices: Vec<*mut std::ffi::c_void>,
+    unregister: MacosMtUnregister,
+    stop: MacosMtStop,
+}
+
+#[cfg(target_os = "macos")]
+impl MacosMultitouchCapture {
+    fn new(context: Arc<MacCaptureContext>) -> Result<Self, String> {
+        use std::ffi::{c_char, c_void};
+
+        type CreateList = unsafe extern "C" fn() -> *const c_void;
+        const RTLD_LAZY: i32 = 0x1;
+
+        #[link(name = "System")]
+        extern "C" {
+            fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> i32;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFArrayGetCount(array: *const c_void) -> isize;
+            fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+            fn CFRelease(value: *const c_void);
+        }
+
+        let library = unsafe {
+            dlopen(
+                b"/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport\0"
+                    .as_ptr()
+                    .cast(),
+                RTLD_LAZY,
             )
         };
-        if mach_port.is_null() {
-            return Err(());
+        if library.is_null() {
+            return Err("could not load macOS MultitouchSupport".into());
         }
 
+        macro_rules! symbol {
+            ($name:literal, $ty:ty) => {{
+                let pointer = unsafe { dlsym(library, concat!($name, "\0").as_ptr().cast()) };
+                if pointer.is_null() {
+                    unsafe { dlclose(library) };
+                    return Err(format!("missing MultitouchSupport symbol {}", $name));
+                }
+                unsafe { std::mem::transmute::<*mut c_void, $ty>(pointer) }
+            }};
+        }
+
+        let create_list = symbol!("MTDeviceCreateList", CreateList);
+        let register = symbol!("MTRegisterContactFrameCallback", MacosMtRegister);
+        let unregister = symbol!("MTUnregisterContactFrameCallback", MacosMtUnregister);
+        let start = symbol!("MTDeviceStart", MacosMtStart);
+        let stop = symbol!("MTDeviceStop", MacosMtStop);
+
+        let array = unsafe { create_list() };
+        if array.is_null() {
+            unsafe { dlclose(library) };
+            return Err("MultitouchSupport returned no device list".into());
+        }
+        let count = unsafe { CFArrayGetCount(array) }.max(0);
+        let mut devices = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let device = unsafe { CFArrayGetValueAtIndex(array, index) } as *mut c_void;
+            if !device.is_null() {
+                devices.push(device);
+            }
+        }
+        if devices.is_empty() {
+            unsafe { CFRelease(array) };
+            unsafe { dlclose(library) };
+            return Err("no multitouch trackpad was found".into());
+        }
+
+        let global = MACOS_MULTITOUCH_CONTEXT.get_or_init(|| Mutex::new(None));
+        *global
+            .lock()
+            .map_err(|_| "multitouch context lock poisoned".to_string())? = Some(context);
+        for device in &devices {
+            unsafe {
+                register(*device, macos_multitouch_contact_callback);
+                let _ = start(*device, 0);
+            }
+        }
+        log::info!(
+            "[trackpad] raw contact capture started for {} device(s)",
+            devices.len()
+        );
         Ok(Self {
-            mach_port: unsafe { CFMachPort::wrap_under_create_rule(mach_port) },
-            _context: context,
+            library,
+            device_array: array,
+            devices,
+            unregister,
+            stop,
         })
     }
-
-    fn mach_port(&self) -> &core_foundation::mach_port::CFMachPort {
-        &self.mach_port
-    }
-
-    fn enable(&self) {
-        use core_foundation::base::TCFType;
-
-        unsafe {
-            macos_raw_event_tap_enable(self.mach_port.as_concrete_TypeRef(), true);
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for RawMacosGestureTap {
+impl Drop for MacosMultitouchCapture {
     fn drop(&mut self) {
-        use core_foundation::base::TCFType;
-        use core_foundation::mach_port::CFMachPortInvalidate;
-
-        unsafe {
-            CFMachPortInvalidate(self.mach_port.as_CFTypeRef() as *mut _);
+        #[link(name = "System")]
+        extern "C" {
+            fn dlclose(handle: *mut std::ffi::c_void) -> i32;
         }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFRelease(value: *const std::ffi::c_void);
+        }
+        for device in &self.devices {
+            unsafe {
+                let _ = (self.stop)(*device);
+                (self.unregister)(*device, macos_multitouch_contact_callback);
+            }
+        }
+        if let Some(global) = MACOS_MULTITOUCH_CONTEXT.get() {
+            if let Ok(mut context) = global.lock() {
+                *context = None;
+            }
+        }
+        unsafe {
+            CFRelease(self.device_array);
+            let _ = dlclose(self.library);
+        }
+        log::info!("[trackpad] raw contact capture stopped");
     }
 }
 
 #[cfg(target_os = "macos")]
-type MacosRawEventTapCallback = unsafe extern "C" fn(
-    proxy: core_graphics::event::CGEventTapProxy,
-    event_type: u32,
-    event: core_graphics::sys::CGEventRef,
-    user_info: *const std::ffi::c_void,
-) -> core_graphics::sys::CGEventRef;
+unsafe extern "C" fn macos_multitouch_contact_callback(
+    _device: *mut std::ffi::c_void,
+    contacts: *const MacosMultitouchContact,
+    contact_count: i32,
+    _timestamp: f64,
+    _frame: i32,
+) -> i32 {
+    if contacts.is_null() || contact_count < 0 || contact_count > 32 {
+        return 0;
+    }
+    let context = MACOS_MULTITOUCH_CONTEXT
+        .get()
+        .and_then(|global| global.lock().ok())
+        .and_then(|context| context.as_ref().cloned());
+    let Some(context) = context else {
+        return 0;
+    };
+    let contacts = unsafe { std::slice::from_raw_parts(contacts, contact_count as usize) };
+    handle_macos_multitouch_frame(&context, contacts);
+    0
+}
 
 #[cfg(target_os = "macos")]
-#[link(name = "ApplicationServices", kind = "framework")]
-extern "C" {
-    #[link_name = "CGEventTapCreate"]
-    fn macos_raw_event_tap_create(
-        tap: core_graphics::event::CGEventTapLocation,
-        place: core_graphics::event::CGEventTapPlacement,
-        options: core_graphics::event::CGEventTapOptions,
-        events_of_interest: u64,
-        callback: MacosRawEventTapCallback,
-        user_info: *const std::ffi::c_void,
-    ) -> core_foundation::mach_port::CFMachPortRef;
+fn handle_macos_multitouch_frame(
+    context: &MacCaptureContext,
+    contacts: &[MacosMultitouchContact],
+) {
+    const SWIPE_SCALE: f64 = 2.5;
+    const PINCH_ACTIVATION_RATIO: f64 = 0.04;
 
-    #[link_name = "CGEventTapEnable"]
-    fn macos_raw_event_tap_enable(tap: core_foundation::mach_port::CFMachPortRef, enable: bool);
+    let Ok(mut state) = context.raw_trackpad_gesture.lock() else {
+        return;
+    };
+    if !context.remote_active.load(Ordering::Relaxed) {
+        *state = MacRawTrackpadGestureState::default();
+        return;
+    }
 
+    let mut events = Vec::with_capacity(3);
+    match contacts.len() {
+        4 => {
+            if state.active == Some(MacRawGestureKind::Pinch) {
+                events.push(InputEvent::Pinch {
+                    magnification: 0.0,
+                    phase: GesturePhase::Ended,
+                });
+            }
+            let centroid = contacts.iter().fold((0.0, 0.0), |sum, contact| {
+                (
+                    sum.0 + f64::from(contact.normalized.position.x),
+                    sum.1 + f64::from(contact.normalized.position.y),
+                )
+            });
+            let centroid = (centroid.0 / 4.0, centroid.1 / 4.0);
+            if state.active != Some(MacRawGestureKind::Swipe) || state.contact_count != 4 {
+                state.active = Some(MacRawGestureKind::Swipe);
+                state.previous_centroid = Some(centroid);
+                events.push(InputEvent::Swipe {
+                    delta_x: 0.0,
+                    delta_y: 0.0,
+                    phase: GesturePhase::Began,
+                });
+            } else if let Some(previous) = state.previous_centroid.replace(centroid) {
+                let delta_x = (centroid.0 - previous.0) * SWIPE_SCALE;
+                let delta_y = (centroid.1 - previous.1) * SWIPE_SCALE;
+                if delta_x.abs().max(delta_y.abs()) > 0.000_01 {
+                    events.push(InputEvent::Swipe {
+                        delta_x,
+                        delta_y,
+                        phase: GesturePhase::Changed,
+                    });
+                }
+            }
+            state.pinch_baseline = None;
+            state.pinch_previous = None;
+        }
+        2 => {
+            if state.active == Some(MacRawGestureKind::Swipe) {
+                events.push(InputEvent::Swipe {
+                    delta_x: 0.0,
+                    delta_y: 0.0,
+                    phase: GesturePhase::Ended,
+                });
+                state.active = None;
+            }
+            let dx = f64::from(
+                contacts[0].normalized.position.x - contacts[1].normalized.position.x,
+            );
+            let dy = f64::from(
+                contacts[0].normalized.position.y - contacts[1].normalized.position.y,
+            );
+            let distance = (dx * dx + dy * dy).sqrt().max(0.000_001);
+            if state.contact_count != 2 {
+                state.pinch_baseline = Some(distance);
+                state.pinch_previous = Some(distance);
+            }
+            let baseline = state.pinch_baseline.unwrap_or(distance);
+            let previous = state.pinch_previous.replace(distance).unwrap_or(distance);
+            if state.active == Some(MacRawGestureKind::Pinch) {
+                events.push(InputEvent::Pinch {
+                    magnification: distance / previous - 1.0,
+                    phase: GesturePhase::Changed,
+                });
+            } else if (distance / baseline - 1.0).abs() >= PINCH_ACTIVATION_RATIO {
+                state.active = Some(MacRawGestureKind::Pinch);
+                events.push(InputEvent::Pinch {
+                    magnification: 0.0,
+                    phase: GesturePhase::Began,
+                });
+                events.push(InputEvent::Pinch {
+                    magnification: distance / baseline - 1.0,
+                    phase: GesturePhase::Changed,
+                });
+            }
+            state.previous_centroid = None;
+        }
+        _ => {
+            match state.active.take() {
+                Some(MacRawGestureKind::Swipe) => events.push(InputEvent::Swipe {
+                    delta_x: 0.0,
+                    delta_y: 0.0,
+                    phase: GesturePhase::Ended,
+                }),
+                Some(MacRawGestureKind::Pinch) => events.push(InputEvent::Pinch {
+                    magnification: 0.0,
+                    phase: GesturePhase::Ended,
+                }),
+                None => {}
+            }
+            state.previous_centroid = None;
+            state.pinch_baseline = None;
+            state.pinch_previous = None;
+        }
+    }
+    state.contact_count = contacts.len();
+    drop(state);
+
+    for event in events {
+        send_macos_trackpad_gesture(context, event);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_macos_trackpad_gesture(context: &MacCaptureContext, event: InputEvent) {
+    let phase = match &event {
+        InputEvent::Swipe { phase, .. } | InputEvent::Pinch { phase, .. } => *phase,
+        _ => GesturePhase::None,
+    };
+    let kind = match &event {
+        InputEvent::Swipe { .. } => "four-finger swipe",
+        InputEvent::Pinch { .. } => "two-finger pinch",
+        _ => "gesture",
+    };
+    let target = context
+        .active
+        .lock()
+        .ok()
+        .and_then(|active| active.as_ref().map(|active| active.target.clone()));
+    let Some(target) = target else {
+        return;
+    };
+    let sent = send_packet(
+        &context.quic_transport,
+        &target,
+        event,
+        &context.layout_state,
+        &context.input_events,
+    );
+    if matches!(phase, GesturePhase::Began | GesturePhase::Ended | GesturePhase::Cancelled) {
+        log::info!("[trackpad] {kind} {phase:?}; sent={sent}");
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn macos_scroll_phase(event: &core_graphics::event::CGEvent, field: u32) -> GesturePhase {
     let bits = event.get_integer_value_field(field);
     gesture_phase_from_nsevent_bits(bits as u64)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_raw_gesture_event_mask() -> u64 {
-    MACOS_RAW_GESTURE_EVENT_TYPES
-        .iter()
-        .fold(0_u64, |mask, event_type| mask | (1_u64 << *event_type))
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" fn macos_raw_gesture_event_callback(
-    _proxy: core_graphics::event::CGEventTapProxy,
-    event_type: u32,
-    event: core_graphics::sys::CGEventRef,
-    user_info: *const std::ffi::c_void,
-) -> core_graphics::sys::CGEventRef {
-    if user_info.is_null() {
-        return event;
-    }
-
-    let context = unsafe { &*(user_info as *const MacCaptureContext) };
-    if matches!(
-        event_type,
-        MACOS_RAW_EVENT_TAP_DISABLED_BY_TIMEOUT | MACOS_RAW_EVENT_TAP_DISABLED_BY_USER_INPUT
-    ) {
-        context.tap_disabled.store(true, Ordering::Relaxed);
-        return event;
-    }
-
-    if context.remote_active.load(Ordering::Relaxed) {
-        repin_macos_cursor_while_remote(context);
-        if let Some(input_event) = macos_input_event_from_gesture(event_type, event) {
-            let target = context
-                .active
-                .lock()
-                .ok()
-                .and_then(|active| active.as_ref().map(|active| active.target.clone()));
-            if let Some(target) = target {
-                let _ = send_packet(
-                    &context.quic_transport,
-                    &target,
-                    input_event,
-                    &context.layout_state,
-                    &context.input_events,
-                );
-            }
-        }
-        return std::ptr::null_mut();
-    }
-
-    event
-}
-
-/// Convert the private NSEvent gesture types delivered through CGEventTap into
-/// the small, public protocol surface MyKVM needs. Mouse button events never
-/// enter this path, so three-finger drag and the user's four-finger middle-click
-/// converter remain on the existing mouse chain.
-#[cfg(target_os = "macos")]
-fn macos_input_event_from_gesture(
-    event_type: u32,
-    event: core_graphics::sys::CGEventRef,
-) -> Option<InputEvent> {
-    use std::{ffi::c_void, os::raw::c_char};
-
-    if !matches!(
-        event_type,
-        MACOS_NSEVENT_TYPE_SWIPE | MACOS_NSEVENT_TYPE_MAGNIFY
-    ) {
-        return None;
-    }
-
-    #[link(name = "AppKit", kind = "framework")]
-    extern "C" {}
-    #[link(name = "objc")]
-    extern "C" {
-        fn objc_getClass(name: *const c_char) -> *mut c_void;
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-
-    unsafe {
-        let class = objc_getClass(b"NSEvent\0".as_ptr() as *const c_char);
-        if class.is_null() {
-            return None;
-        }
-        let make_event: extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            core_graphics::sys::CGEventRef,
-        ) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
-        let ns_event = make_event(
-            class,
-            sel_registerName(b"eventWithCGEvent:\0".as_ptr() as *const c_char),
-            event,
-        );
-        if ns_event.is_null() {
-            return None;
-        }
-
-        let get_bits: extern "C" fn(*mut c_void, *mut c_void) -> u64 =
-            std::mem::transmute(objc_msgSend as *const ());
-        let get_f64: extern "C" fn(*mut c_void, *mut c_void) -> f64 =
-            std::mem::transmute(objc_msgSend as *const ());
-        let phase = gesture_phase_from_nsevent_bits(get_bits(
-            ns_event,
-            sel_registerName(b"phase\0".as_ptr() as *const c_char),
-        ));
-
-        match event_type {
-            MACOS_NSEVENT_TYPE_SWIPE => Some(InputEvent::Swipe {
-                delta_x: get_f64(
-                    ns_event,
-                    sel_registerName(b"deltaX\0".as_ptr() as *const c_char),
-                ),
-                delta_y: get_f64(
-                    ns_event,
-                    sel_registerName(b"deltaY\0".as_ptr() as *const c_char),
-                ),
-                phase,
-            }),
-            MACOS_NSEVENT_TYPE_MAGNIFY => Some(InputEvent::Pinch {
-                magnification: get_f64(
-                    ns_event,
-                    sel_registerName(b"magnification\0".as_ptr() as *const c_char),
-                ),
-                phase,
-            }),
-            _ => None,
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -6171,19 +6280,6 @@ mod tests {
         // Ordinary keys carry no modifier flag.
         assert!(windows_vk_to_mac_flag(0x41).is_none()); // 'A'
         assert!(windows_vk_to_mac_flag(0x20).is_none()); // Space
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_raw_gesture_mask_covers_trackpad_system_gestures() {
-        let mask = macos_raw_gesture_event_mask();
-
-        for event_type in MACOS_RAW_GESTURE_EVENT_TYPES {
-            assert_ne!(mask & (1_u64 << *event_type), 0);
-        }
-        assert_ne!(mask & (1_u64 << MACOS_NSEVENT_TYPE_SWIPE), 0);
-        assert_ne!(mask & (1_u64 << MACOS_NSEVENT_TYPE_SYSTEM_DEFINED), 0);
-        assert_eq!(mask & (1_u64 << 22), 0);
     }
 
     #[cfg(target_os = "macos")]
