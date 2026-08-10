@@ -75,12 +75,27 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml pairing_socket_binds_to_advertised_ipv4_address --lib
 
       - name: Build unsigned DMG
-        run: npm exec -- tauri build --ci --bundles dmg --no-sign --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        id: build_dmg
+        continue-on-error: true
+        run: |
+          for attempt in 1 2 3; do
+            npm exec -- tauri build --ci --bundles dmg --no-sign --config '{"bundle":{"createUpdaterArtifacts":false}}' && exit 0
+            echo "DMG bundling attempt ${attempt} failed; retrying..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Package macOS app fallback
+        if: steps.build_dmg.outcome == 'failure'
+        run: ditto -c -k --sequesterRsrc --keepParent src-tauri/target/release/bundle/macos/mykvm.app src-tauri/target/release/bundle/macos/mykvm.app.zip
 
       - name: Upload macOS installer
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: MyKVM-Trackpad-macOS-arm64
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/mykvm.app.zip
           if-no-files-found: error
           retention-days: 7
