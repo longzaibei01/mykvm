@@ -85,9 +85,27 @@ jobs:
           done
           exit 1
 
-      - name: Package macOS app fallback
-        if: steps.build_dmg.outcome == 'failure'
-        run: ditto -c -k --sequesterRsrc --keepParent src-tauri/target/release/bundle/macos/mykvm.app src-tauri/target/release/bundle/macos/mykvm.app.zip
+      - name: Apply stable ad-hoc identity and package DMG
+        if: always()
+        run: |
+          APP_PATH="src-tauri/target/release/bundle/macos/mykvm.app"
+          DMG_DIR="src-tauri/target/release/bundle/dmg"
+          STAGE_DIR="$RUNNER_TEMP/mykvm-dmg"
+          test -d "$APP_PATH"
+          codesign --force --deep --sign - \
+            --requirements '=designated => identifier "com.xzhpl.mykvm"' \
+            "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          rm -rf "$STAGE_DIR"
+          mkdir -p "$STAGE_DIR" "$DMG_DIR"
+          ditto "$APP_PATH" "$STAGE_DIR/mykvm.app"
+          ln -s /Applications "$STAGE_DIR/Applications"
+          rm -f "$DMG_DIR"/*.dmg
+          hdiutil create \
+            -volname "MyKVM 0.9.12 Trackpad" \
+            -srcfolder "$STAGE_DIR" \
+            -ov -format UDZO \
+            "$DMG_DIR/MyKVM-0.9.12-macOS-arm64-trackpad.dmg"
 
       - name: Upload macOS installer
         if: always()
