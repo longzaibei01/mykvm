@@ -88,10 +88,18 @@ jobs:
       - name: Apply stable ad-hoc identity and package DMG
         if: always()
         run: |
-          APP_PATH="src-tauri/target/release/bundle/macos/mykvm.app"
           DMG_DIR="src-tauri/target/release/bundle/dmg"
+          ORIGINAL_DMG="$(find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -print -quit)"
+          MOUNT_DIR="$RUNNER_TEMP/mykvm-original-dmg"
+          APP_PATH="$RUNNER_TEMP/mykvm-stable.app"
           STAGE_DIR="$RUNNER_TEMP/mykvm-dmg"
-          test -d "$APP_PATH"
+          test -f "$ORIGINAL_DMG"
+          mkdir -p "$MOUNT_DIR"
+          hdiutil attach "$ORIGINAL_DMG" -mountpoint "$MOUNT_DIR" -nobrowse -readonly
+          SOURCE_APP="$(find "$MOUNT_DIR" -maxdepth 2 -name '*.app' -print -quit)"
+          test -d "$SOURCE_APP"
+          ditto "$SOURCE_APP" "$APP_PATH"
+          hdiutil detach "$MOUNT_DIR"
           codesign --force --deep --sign - \
             --requirements '=designated => identifier "com.xzhpl.mykvm"' \
             "$APP_PATH"
