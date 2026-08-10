@@ -10,6 +10,7 @@ release will reuse them).
 
 - Align the custom trackpad build's app version with upstream `v0.9.12` so the updater does not repeatedly offer the already-current upstream release.
 - Run the Windows installer elevated so it reliably creates the inbound UDP firewall rule required for pairing.
+- Bind pairing requests to the same local IPv4 address advertised by discovery, fixing silent send failures on Macs with Ethernet and Wi-Fi active on the same subnet.
 
 ### Added
 
