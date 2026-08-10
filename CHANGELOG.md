@@ -9,6 +9,7 @@ release will reuse them).
 ## [Unreleased]
 
 - Align the custom trackpad build's app version with upstream `v0.9.12` so the updater does not repeatedly offer the already-current upstream release.
+- Run the Windows installer elevated so it reliably creates the inbound UDP firewall rule required for pairing.
 
 ### Added
 
