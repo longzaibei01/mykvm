@@ -45,7 +45,9 @@
 
 !macro NSIS_HOOK_POSTINSTALL
   ; Allow inbound UDP to mykvm.exe so LAN peers can discover and reach this
-  ; device. Best-effort: only succeeds when the installer runs elevated.
+  ; device. The NSIS bundle uses perMachine mode, so this hook is elevated and
+  ; the rule is installed reliably instead of silently failing for current-user
+  ; installs.
   DetailPrint "Configuring Windows Defender Firewall for mykvm..."
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="MyKVM (UDP-In)"'
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="MyKVM (UDP-In)" dir=in action=allow program="$INSTDIR\mykvm.exe" protocol=udp profile=any enable=yes'
